@@ -205,6 +205,48 @@ def test_staging_incomplete_when_marker_not_yet_set(
     assert staging_complete(ai_input, state) is False
 
 
+def test_staging_complete_when_rotation_held_open(
+    ai_input: AppInterfaceInput,
+) -> None:
+    """A rotation held open by the tenant (finalize_auth_token_rotation: false) is not an error state to fast-retry (APPSRE-15766)."""
+    ai_input.data.transit_encryption_mode = "required"
+    ai_input.data.finalize_auth_token_rotation = False
+    state = _state({
+        "aws_elasticache_replication_group.this": {
+            "transit_encryption_enabled": True,
+            "transit_encryption_mode": "required",
+        },
+        "terraform_data.auth_token_rotation[0]": {"input": "ROTATE_EXISTING"},
+        "random_password.this[0]": {"keepers": None},
+    })
+
+    assert staging_complete(ai_input, state) is True
+
+
+def test_staging_incomplete_when_first_time_introduction_with_stale_hold(
+    ai_input: AppInterfaceInput,
+) -> None:
+    """A first-time introduction (marker ROTATE) is never holdable.
+
+    Even with a stale finalize_auth_token_rotation: false left in the config,
+    staging must fast-retry to SET - otherwise the cluster would keep
+    accepting unauthenticated connections indefinitely while staging_complete
+    wrongly reports done.
+    """
+    ai_input.data.transit_encryption_mode = "required"
+    ai_input.data.finalize_auth_token_rotation = False
+    state = _state({
+        "aws_elasticache_replication_group.this": {
+            "transit_encryption_enabled": True,
+            "transit_encryption_mode": "required",
+        },
+        "terraform_data.auth_token_rotation[0]": {"input": "ROTATE"},
+        "random_password.this[0]": {"keepers": None},
+    })
+
+    assert staging_complete(ai_input, state) is False
+
+
 def test_staging_complete_when_fully_settled(ai_input: AppInterfaceInput) -> None:
     ai_input.data.transit_encryption_mode = "required"
     state = _state({

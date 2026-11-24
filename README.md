@@ -179,6 +179,38 @@ and `preferred`-forever would leave the reconciler permanently stuck waiting for
   (`sys.exit(1)`) instead of waiting for the next ~24h scheduled reconcile while any of the
   above stages are incomplete.
 
+**Holding the ROTATE window open for slow-rolling consumers (APPSRE-15766)**: by default, the
+follow-up `SET` that revokes the previous token is applied on the very next reconcile run.
+Applications that take longer than one run to pick up the new token (rendered config secret
+MRs, 15-30 minute pod recycles) get locked out when the old token is revoked. Such tenants
+can set `finalize_auth_token_rotation: false` (module input, e.g. under the resource's
+`overrides`) to hold the window open: while a rotation is pending, `hooks/pre_plan.py` keeps
+returning `ROTATE`, the config stays identical to the last successful apply, and Terraform
+no-ops the replication group — both the old and new tokens remain valid for as long as the
+hold lasts. The rotation then becomes two deliberate steps:
+
+1. Change `reset_password` to a new marker (with `finalize_auth_token_rotation: false`) —
+   the token is rotated, both tokens work, consumers roll at their own pace.
+2. Once every consumer authenticates with the new token, release the hold
+   (`finalize_auth_token_rotation: true`, or remove the field) — the next apply finalizes
+   with `SET` and revokes the old token.
+
+The hold only applies to a **replacement of an already-required token** — the
+`terraform_data.auth_token_rotation` marker records the scope of a pending rotation
+(`ROTATE_EXISTING`) versus a first-time AUTH introduction (`ROTATE`), and only the former is
+holdable. A first-time introduction always fast-retries to `SET`, so a stale
+`finalize_auth_token_rotation: false` left in the config cannot leave a cluster accepting
+unauthenticated connections indefinitely. In steady state the hold is likewise unreachable
+and cannot introduce a stray `ROTATE`. A `reset_password` marker change still restarts the
+cycle regardless of the hold.
+
+**Do not bump `reset_password` again while a hold is open.** AWS drops the *oldest* token
+when a cluster that already carries two tokens is ROTATEd again — so a second rotation
+during a hold revokes the token that slow consumers may still be authenticating with, with
+no `SET` involved. Release the hold and let the rotation settle before starting another
+one. `hooks/pre_plan.py` logs a warning whenever `reset_password` changes while a rotation
+is still pending.
+
 **Known limitation: a failed first `ROTATE` attempt is indistinguishable from a legacy
 resource.** `random_password.this[0]` must exist *before* `aws_elasticache_replication_group.this`
 is applied (its `auth_token` attribute references `random_password.this[0].result`), so it
